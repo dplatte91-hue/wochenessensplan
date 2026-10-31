@@ -84,7 +84,7 @@ h2 { font-size: 1.15rem; margin: 22px 0 8px; color: var(--muted); font-weight: 6
 
 select, input, button { font: inherit; color: inherit; }
 
-select, input[type="text"], input[type="number"], input:not([type]) {
+select, input[type="text"], input[type="number"], input[type="email"], input[type="password"], input:not([type]) {
   font-size: 18px; /* >= 16px verhindert Zoom auf dem iPhone */
   padding: 12px;
   border-radius: 10px;
@@ -155,6 +155,13 @@ label.field span { display: block; font-size: 0.9rem; color: var(--muted); margi
 
 .hint { font-size: 0.9rem; color: var(--muted); }
 
+.message {
+  background: var(--accent-soft);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.95rem;
+}
+
 /* Tableiste unten */
 .tabbar {
   position: fixed;
@@ -166,6 +173,7 @@ label.field span { display: block; font-size: 0.9rem; color: var(--muted); margi
   border-top: 1px solid var(--line);
   padding-bottom: env(safe-area-inset-bottom);
 }
+.tabbar[hidden] { display: none; }
 .tabbar button {
   background: transparent;
   border-radius: 0;
