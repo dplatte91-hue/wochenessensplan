@@ -1,0 +1,3 @@
+# Dienstkonto-Schlüssel niemals ins (öffentliche) Repository
+*key*.json
+*-firebase-adminsdk-*.json
