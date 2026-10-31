@@ -134,6 +134,9 @@ try { tab = localStorage.getItem(TAB_KEY) || 'plan'; } catch (e) { /* ignorieren
 let view = 'loading';  // loading | setup | login | denied | app
 let user = null;
 let editing = null;    // Kopie des Rezepts, das gerade bearbeitet wird
+let importing = null;  // { text, recipes, error } während „Rezepte einfügen“
+let notice = '';       // kurze Rückmeldung oben auf der Rezepte-Seite
+let showTemplate = false; // Vorlage zum manuellen Kopieren anzeigen, falls die Zwischenablage nicht geht
 let loginMessage = '';
 let syncError = '';
 
@@ -453,8 +456,121 @@ function renderRezepte() {
         </div>`).join('')
     : `<div class="empty">Noch keine Rezepte.</div>`;
   return `
+    ${notice ? `<p class="message">${esc(notice)}</p>` : ''}
     <div class="card">${list}</div>
-    <button class="block primary" data-action="new-recipe">＋ Neues Rezept</button>`;
+    <button class="block primary" data-action="new-recipe">＋ Neues Rezept</button>
+
+    <h2>Rezepte mit Claude anlegen</h2>
+    <p class="hint">1. Vorlage kopieren · 2. in Claude einfügen und Gerichte dazuschreiben · 3. Claudes Antwort kopieren und hier einfügen.</p>
+    <div class="actions">
+      <button data-action="copy-template">📋 Vorlage kopieren</button>
+      <button class="primary" data-action="open-import">📥 Rezepte einfügen</button>
+    </div>
+    ${showTemplate ? `
+      <p class="hint">Kopieren hat nicht geklappt – bitte den Text markieren und selbst kopieren:</p>
+      <textarea readonly rows="8">${esc(claudeTemplate())}</textarea>` : ''}`;
+}
+
+// ---------- Rezepte aus Claude einfügen ----------
+
+function claudeTemplate() {
+  const names = [...new Set(state.recipes.flatMap(r => r.ingredients.map(i => i.name.trim())).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, 'de'));
+  return `Ich nutze eine Essensplan-App für unsere Familie (2 Erwachsene, 1 Kleinkind). Bitte schreib mir die Rezepte, die ich unten nenne, im folgenden JSON-Format, damit ich sie in die App einfügen kann.
+
+Regeln:
+- Mengen für eine Mahlzeit für 2 Erwachsene und 1 Kleinkind
+- vegetarisch und kleinkindgerecht (wenig Salz, nicht scharf), außer ich schreibe etwas anderes
+- "einheit" nur eine von: ${UNITS.join(', ')}
+- "kategorie" genau eine von: ${state.aisles.join(' | ')}
+- Gleiche Zutaten immer gleich benennen, damit die Einkaufsliste sie zusammenrechnen kann. Diese Namen gibt es schon: ${names.join(', ')}
+- "zubereitung" als kurze nummerierte Schritte
+- Antworte nur mit dem JSON-Codeblock, ohne weiteren Text.
+
+Format:
+{"rezepte": [{"name": "Gemüsecurry", "zutaten": [{"name": "Zwiebel", "menge": 1, "einheit": "Stück", "kategorie": "Obst & Gemüse"}], "zubereitung": ["Zwiebel würfeln und andünsten.", "…"]}]}
+
+Meine Rezepte: `;
+}
+
+function matchCategory(cat) {
+  const c = String(cat || '').trim().toLowerCase();
+  if (c) {
+    const exact = state.aisles.find(a => a.toLowerCase() === c);
+    if (exact) return exact;
+    const partial = state.aisles.find(a => a.toLowerCase().includes(c) || c.includes(a.toLowerCase()));
+    if (partial) return partial;
+    // z. B. „Obstregal“ → „Obst & Gemüse“, „Tiefkühlkost“ → „Tiefkühl“
+    const firstWord = state.aisles.find(a => {
+      const w = a.toLowerCase().split(/[\s,&]+/)[0];
+      return w.length >= 4 && (c.startsWith(w) || w.startsWith(c));
+    });
+    if (firstWord) return firstWord;
+  }
+  return null;
+}
+
+// Liest Claudes Antwort (auch mit ```json … ``` drumherum) und prüft sie.
+function parseRecipes(text) {
+  const start = text.search(/[[{]/);
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (start < 0 || end < start) throw new Error('Kein Rezept gefunden. Bitte die komplette Antwort von Claude einfügen.');
+  let data;
+  try { data = JSON.parse(text.slice(start, end + 1)); } catch (e) {
+    throw new Error('Das Format ist fehlerhaft. Bitte Claude bitten: „Gib es nochmal nur als JSON aus.“');
+  }
+  const list = Array.isArray(data) ? data : data.rezepte || data.recipes || [data];
+  const fallback = state.aisles.includes('Drogerie & Sonstiges') ? 'Drogerie & Sonstiges' : state.aisles[state.aisles.length - 1];
+
+  const recipes = list.map(r => {
+    const name = String(r.name || r.titel || '').trim();
+    const warnings = [];
+    const ingredients = (r.zutaten || r.ingredients || []).map(z => {
+      const rawCat = z.kategorie ?? z.category;
+      let category = matchCategory(rawCat);
+      if (!category) {
+        category = fallback;
+        warnings.push(`${z.name}: Kategorie „${rawCat ?? '–'}“ unbekannt → ${fallback}`);
+      }
+      return ing(String(z.name || '').trim(), parseAmount(z.menge ?? z.amount) ?? '', String(z.einheit ?? z.unit ?? '').trim(), category);
+    }).filter(i => i.name);
+    let steps = r.zubereitung ?? r.steps ?? '';
+    if (Array.isArray(steps)) steps = steps.map((s, i) => `${i + 1}. ${String(s).replace(/^\d+\.\s*/, '')}`).join('\n');
+    const existing = state.recipes.find(x => x.name.trim().toLowerCase() === name.toLowerCase());
+    return { id: existing ? existing.id : uid(), name: existing ? existing.name : name, ingredients, zubereitung: String(steps), replaces: !!existing, warnings };
+  }).filter(r => r.name);
+
+  if (!recipes.length) throw new Error('Kein Rezept gefunden. Bitte die komplette Antwort von Claude einfügen.');
+  return recipes;
+}
+
+function renderImport() {
+  const { text, recipes, error } = importing;
+  const preview = recipes ? `
+    <h2>Vorschau</h2>
+    <div class="card">${recipes.map(r => `
+      <div class="row" style="flex-direction:column;align-items:stretch;gap:4px">
+        <div class="item-name">${esc(r.name)} <span class="badge">${r.replaces ? 'ersetzt vorhandenes' : 'neu'}</span></div>
+        <div class="item-from">${r.ingredients.map(i => esc(`${i.name} ${i.amount ? fmtAmount(i.amount) : ''} ${i.unit}`.trim())).join(' · ')}</div>
+        ${r.warnings.map(w => `<div class="item-from">⚠️ ${esc(w)}</div>`).join('')}
+      </div>`).join('')}
+    </div>
+    <button class="block primary" data-action="apply-import">✓ ${recipes.length} ${recipes.length === 1 ? 'Rezept' : 'Rezepte'} übernehmen</button>` : '';
+
+  return `
+    <p class="hint">Kopiere Claudes Antwort und füge sie hier ein.</p>
+    <button class="block" data-action="paste-import">📋 Aus Zwischenablage einfügen</button>
+    <textarea id="import-text" rows="7" placeholder="{&quot;rezepte&quot;: [ … ] }" style="margin-top:10px">${esc(text)}</textarea>
+    ${error ? `<p class="message">${esc(error)}</p>` : ''}
+    <button class="block ${recipes ? '' : 'primary'}" data-action="parse-import">Vorschau anzeigen</button>
+    ${preview}
+    <button class="block danger" data-action="cancel-import">Abbrechen</button>`;
+}
+
+function runImportPreview(text) {
+  importing = { text, recipes: null, error: '' };
+  try { importing.recipes = parseRecipes(text); } catch (err) { importing.error = err.message; }
+  render();
 }
 
 function renderEditor() {
@@ -476,6 +592,9 @@ function renderEditor() {
     <div class="card">${rows || '<div class="empty">Noch keine Zutaten.</div>'}</div>
     <datalist id="units">${UNITS.map(u => `<option value="${u}">`).join('')}</datalist>
     <button class="block" data-action="add-ing">＋ Zutat hinzufügen</button>
+    <label class="field" style="margin-top:18px"><span>Zubereitung (optional)</span>
+      <textarea id="recipe-steps" rows="6" placeholder="1. …">${esc(r.zubereitung)}</textarea>
+    </label>
     <div class="actions">
       <button class="primary" data-action="save-recipe">Speichern</button>
       <button data-action="cancel-edit">Abbrechen</button>
@@ -488,6 +607,8 @@ function syncEditor() {
   if (!editing) return;
   const name = document.getElementById('recipe-name');
   if (name) editing.name = name.value;
+  const steps = document.getElementById('recipe-steps');
+  if (steps) editing.zubereitung = steps.value;
   document.querySelectorAll('.ing').forEach(row => {
     const i = editing.ingredients[+row.dataset.idx];
     row.querySelectorAll('[data-field]').forEach(el => {
@@ -538,7 +659,7 @@ function render() {
   const active = document.activeElement;
   const activeId = active && $app.contains(active) ? active.id : null;
   const kept = {};
-  for (const id of ['extra-name', 'extra-cat', 'new-aisle', 'login-email', 'login-password']) {
+  for (const id of ['extra-name', 'extra-cat', 'new-aisle', 'login-email', 'login-password', 'import-text']) {
     const el = document.getElementById(id);
     if (el) kept[id] = el.value;
   }
@@ -562,6 +683,9 @@ function render() {
   } else if (editing) {
     $title.textContent = editing.name || 'Neues Rezept';
     $app.innerHTML = renderEditor();
+  } else if (importing) {
+    $title.textContent = 'Rezepte einfügen';
+    $app.innerHTML = renderImport();
   } else {
     $title.textContent = TITLES[tab];
     $app.innerHTML = { plan: renderPlan, einkauf: renderEinkauf, rezepte: renderRezepte, einstellungen: renderEinstellungen }[tab]();
@@ -582,6 +706,9 @@ function render() {
 
 function setTab(t) {
   editing = null;
+  importing = null;
+  notice = '';
+  showTemplate = false;
   tab = t;
   try { localStorage.setItem(TAB_KEY, t); } catch (e) { /* ignorieren */ }
   render();
@@ -689,6 +816,48 @@ $app.addEventListener('click', e => {
       state.checked = {};
       state.extras = [];
       remote(['checked', {}], ['extras', []]);
+      break;
+
+    case 'copy-template':
+      showTemplate = false;
+      (navigator.clipboard ? navigator.clipboard.writeText(claudeTemplate()) : Promise.reject())
+        .then(() => { notice = 'Vorlage kopiert ✓ Jetzt in Claude einfügen und die gewünschten Gerichte dazuschreiben.'; })
+        .catch(() => { showTemplate = true; })
+        .finally(render);
+      return;
+    case 'open-import':
+      notice = '';
+      importing = { text: '', recipes: null, error: '' };
+      render();
+      window.scrollTo(0, 0);
+      return;
+    case 'paste-import':
+      (navigator.clipboard?.readText ? navigator.clipboard.readText() : Promise.reject())
+        .then(runImportPreview)
+        .catch(() => {
+          importing.error = 'Bitte lange in das Textfeld tippen und „Einsetzen“ wählen.';
+          render();
+          document.getElementById('import-text').focus();
+        });
+      return;
+    case 'parse-import':
+      runImportPreview(document.getElementById('import-text').value);
+      return;
+    case 'apply-import': {
+      for (const { replaces, warnings, ...r } of importing.recipes) {
+        const pos = state.recipes.findIndex(x => x.id === r.id);
+        if (pos >= 0) state.recipes[pos] = r; else state.recipes.push(r);
+      }
+      const n = importing.recipes.length;
+      notice = `${n} ${n === 1 ? 'Rezept' : 'Rezepte'} übernommen ✓`;
+      importing = null;
+      remote(['recipes', state.recipes]);
+      render();
+      window.scrollTo(0, 0);
+      return;
+    }
+    case 'cancel-import':
+      importing = null;
       break;
 
     case 'edit':
